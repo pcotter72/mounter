@@ -14,6 +14,19 @@ not a diff you can apply.
 **The fork requires AmigaOS 3.1 (V40) and up** — upstream's Kickstart 1.3/2.x
 fallbacks are gone (see Removed).
 
+## 2026-11 — the duplicate-extent guard compares blocks
+
+- **`is_same_extent()` did not match a node whose environment had changed after the
+  mount.** With fat95 (4.1 and 4.2) the node of a FAT partition that starts at block 63,
+  on a stick whose boot block says 63 sectors per track, was made with `BlocksPerTrack`
+  1, `LowCyl` 63, `HighCyl` 1048319 and read `BlocksPerTrack` 63, `LowCyl` 1, `HighCyl`
+  16639 afterwards: the same blocks in other units. `LowCyl` and `HighCyl` no longer
+  equalled ours, so a hub port power cycle (the stick is back before the removable task
+  has unmounted it) mounted that partition again, `UMSD2:` beside `UMSD0:`, once per
+  cycle. The first and last block of both environments are compared now; the fields
+  themselves only when a geometry is empty or does not fit 32 bits. A stick whose
+  partition starts at block 2048 was not affected: its environment stays as written.
+
 ## 2026-11 — the duplicate-extent guard matches again
 
 - **`is_same_extent()` never matched a node of ours.** `MakeDosNode()` counts the

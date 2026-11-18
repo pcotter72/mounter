@@ -267,9 +267,48 @@ static BOOL bstr_equal_ci(const UBYTE *bstr, const UBYTE *chars, UWORD len)
 	return TRUE;
 }
 
-// TRUE if this startup packet describes our device, our unit and this exact
-// block extent.
-static BOOL is_same_extent(struct MountData *md, BPTR startup, ULONG lowCyl, ULONG highCyl)
+// The first and last block of the extent a DosEnvec describes: its cylinder
+// range in the envec's own geometry. FALSE if the geometry is empty or the
+// numbers do not fit 32 bits; the caller then compares the fields themselves.
+static BOOL extent_blocks(const struct DosEnvec *de, ULONG *first, ULONG *last)
+{
+	if (!de->de_Surfaces || !de->de_BlocksPerTrack || de->de_HighCyl < de->de_LowCyl ||
+	    de->de_BlocksPerTrack > 0xFFFFFFFFUL / de->de_Surfaces) {
+		return FALSE;
+	}
+	const ULONG perCyl = de->de_Surfaces * de->de_BlocksPerTrack;
+	if (de->de_HighCyl == 0xFFFFFFFFUL || de->de_HighCyl + 1 > 0xFFFFFFFFUL / perCyl) {
+		return FALSE;
+	}
+	*first = de->de_LowCyl * perCyl;
+	*last  = (de->de_HighCyl + 1) * perCyl - 1;
+	return TRUE;
+}
+
+// TRUE if the two environments describe the same blocks.
+//
+// Not a comparison of the fields: a node's environment can change after the
+// mount. With fat95 (4.1 and 4.2, measured) the node of a FAT partition that
+// starts at block 63 on a stick whose boot block says 63 sectors per track,
+// made here with BlocksPerTrack 1, LowCyl 63, HighCyl 1048319, read
+// BlocksPerTrack 63, LowCyl 1, HighCyl 16639 afterwards - the same blocks in
+// other units. Comparing LowCyl and HighCyl alone then never matched, and
+// every re-probe of the unit mounted that partition again.
+static BOOL same_blocks(const struct DosEnvec *have, const struct DosEnvec *want)
+{
+	ULONG haveFirst, haveLast, wantFirst, wantLast;
+
+	if (extent_blocks(have, &haveFirst, &haveLast) && extent_blocks(want, &wantFirst, &wantLast)) {
+		return (haveFirst == wantFirst) && (haveLast == wantLast);
+	}
+	return (have->de_Surfaces == want->de_Surfaces) &&
+	       (have->de_BlocksPerTrack == want->de_BlocksPerTrack) &&
+	       (have->de_LowCyl == want->de_LowCyl) && (have->de_HighCyl == want->de_HighCyl);
+}
+
+// TRUE if this startup packet describes our device, our unit and exactly the
+// blocks of this extent (want: the environment of the volume to be mounted).
+static BOOL is_same_extent(struct MountData *md, BPTR startup, const struct DosEnvec *want)
 {
 	struct FileSysStartupMsg *fssm = (struct FileSysStartupMsg *)BADDR(startup);
 	const UBYTE *dev;
@@ -284,7 +323,7 @@ static BOOL is_same_extent(struct MountData *md, BPTR startup, ULONG lowCyl, ULO
 	if (!dev || !de || de->de_TableSize < DE_UPPERCYL) {
 		return FALSE;
 	}
-	if (de->de_LowCyl != lowCyl || de->de_HighCyl != highCyl) {
+	if (!same_blocks(de, want)) {
 		return FALSE;
 	}
 	// MakeDosNode() counts the terminating NUL in this BSTR's length
@@ -307,7 +346,7 @@ static BOOL is_same_extent(struct MountData *md, BPTR startup, ULONG lowCyl, ULO
 //
 // Identity is device + unit + extent rather than the DOS name, so two different
 // drives that both want CD0 are still renamed apart exactly as before.
-static BOOL is_extent_mounted(struct MountData *md, ULONG lowCyl, ULONG highCyl)
+static BOOL is_extent_mounted(struct MountData *md, const struct DosEnvec *want)
 {
 	struct ExecBase *SysBase = md->SysBase;
 	BOOL found = FALSE;
@@ -319,7 +358,7 @@ static BOOL is_extent_mounted(struct MountData *md, ULONG lowCyl, ULONG highCyl)
 		 bn = (struct BootNode*)bn->bn_Node.ln_Succ)
 	{
 		struct DeviceNode *dn = bn->bn_DeviceNode;
-		if (dn && is_same_extent(md, dn->dn_Startup, lowCyl, highCyl)) {
+		if (dn && is_same_extent(md, dn->dn_Startup, want)) {
 			found = TRUE;
 			break;
 		}
@@ -331,7 +370,7 @@ static BOOL is_extent_mounted(struct MountData *md, ULONG lowCyl, ULONG highCyl)
 		struct DosLibrary *DOSBase = md->DOSBase;
 		struct DosList *dl = LockDosList(LDF_DEVICES | LDF_READ);
 		while ((dl = NextDosEntry(dl, LDF_DEVICES))) {
-			if (is_same_extent(md, (BPTR)dl->dol_misc.dol_handler.dol_Startup, lowCyl, highCyl)) {
+			if (is_same_extent(md, (BPTR)dl->dol_misc.dol_handler.dol_Startup, want)) {
 				found = TRUE;
 				break;
 			}
@@ -340,7 +379,7 @@ static BOOL is_extent_mounted(struct MountData *md, ULONG lowCyl, ULONG highCyl)
 	}
 
 	if (found) {
-		dbg("Extent %lu..%lu on unit %lu already mounted\n", lowCyl, highCyl, md->unitnum);
+		dbg("Extent %lu..%lu on unit %lu already mounted\n", want->de_LowCyl, want->de_HighCyl, md->unitnum);
 	}
 	return found;
 }
@@ -631,7 +670,7 @@ enum MountOutcome mnt_mount_volume(struct MountData *md, struct Volume *vol)
 	struct ExpansionBase *ExpansionBase = md->ExpansionBase;   /* MakeDosNode base */
 	UBYTE name[DEVNAME_BUFSIZE];
 
-	if (is_extent_mounted(md, vol->pp.de.de_LowCyl, vol->pp.de.de_HighCyl)) {
+	if (is_extent_mounted(md, &vol->pp.de)) {
 		md->alreadyMounted++;
 		md->mounted++;
 		return MOUNT_ALREADY;
